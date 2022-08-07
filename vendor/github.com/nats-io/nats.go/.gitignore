@@ -20,17 +20,23 @@ _cgo_export.*
 _testmain.go
 
 *.exe
-*.test
-*.prof
-.idea/
-dist/
-**/junit.xml
-**/.env
-.vscode/
-coverage.txt
 
-/bin
-/.go
+# Emacs
+*~
+\#*\#
+.\#*
 
-apiserver.local.config/**
+# vi/vim
+.??*.swp
+
+# Mac
 .DS_Store
+
+# Eclipse
+.project
+.settings/
+
+# bin
+
+# Goland
+.idea
