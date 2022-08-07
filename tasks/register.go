@@ -63,17 +63,20 @@ func Register(t TaskType, fn interface{}, opts ...funcr.Options) error {
 
 	typ := reflect.TypeOf(fn)
 	if typ.Kind() != reflect.Func {
-		return fmt.Errorf("fn %s must be a function, found %s", typ, typ.Kind())
+		return fmt.Errorf("%s must be a function, found %s", typ, typ.Kind())
 	}
 
 	switch typ.NumIn() {
 	case 2:
 		etyp := typ.In(0)
 		if !etyp.Implements(ctxType) {
-			return fmt.Errorf("fn %s's first argument must be context.Context", typ)
+			return fmt.Errorf("%s's first argument must be context.Context", typ)
+		}
+		if typ.In(1).Kind() == reflect.Pointer {
+			return fmt.Errorf("%s's second argument must not be a pointer", typ)
 		}
 	default:
-		return fmt.Errorf("fn %s is expected take 2 arguments(ctx context.Context, in T)", typ)
+		return fmt.Errorf("%s is expected take 2 arguments(ctx context.Context, in T)", typ)
 	}
 
 	switch typ.NumOut() {
@@ -81,12 +84,12 @@ func Register(t TaskType, fn interface{}, opts ...funcr.Options) error {
 		etyp := typ.Out(0)
 		if !etyp.Implements(errorType) {
 			if reflect.New(etyp).Type().Implements(errorType) {
-				return fmt.Errorf("fn %s return type should be *%s to be considered an error", typ, etyp.Name())
+				return fmt.Errorf("%s return type should be *%s to be considered an error", typ, etyp.Name())
 			}
-			return fmt.Errorf("fn %s return type must be an error", typ)
+			return fmt.Errorf("%s return type must be an error", typ)
 		}
 	default:
-		return fmt.Errorf("fn %s must only return an error", typ)
+		return fmt.Errorf("%s must only return an error", typ)
 	}
 
 	var def TaskDef
@@ -101,8 +104,8 @@ func Register(t TaskType, fn interface{}, opts ...funcr.Options) error {
 	return nil
 }
 
-func MustRegister(t TaskType, fn interface{}) {
-	if err := Register(t, fn); err != nil {
+func MustRegister(t TaskType, fn interface{}, opts ...funcr.Options) {
+	if err := Register(t, fn, opts...); err != nil {
 		panic(err)
 	}
 }

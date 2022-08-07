@@ -36,6 +36,41 @@ import (
 	"k8s.io/klog/v2"
 )
 
+type Options struct {
+	RequestTimeout time.Duration
+
+	// same as stream
+	Stream string
+
+	// manager id, < 0 means auto detect
+	Id int
+	// hostname
+	Name string
+
+	NumReplicas int
+	NumWorkers  int
+
+	// sends
+	NotificationSubjectPrefix string
+
+	LogErrors bool
+}
+
+func DefaultOptions() Options {
+	hostname, _ := os.Hostname()
+
+	return Options{
+		RequestTimeout:            5 * time.Second,
+		Stream:                    "natjobs",
+		Id:                        1,
+		Name:                      hostname,
+		NumReplicas:               1,
+		NumWorkers:                1,
+		NotificationSubjectPrefix: "notifications",
+		LogErrors:                 true,
+	}
+}
+
 type TaskManager struct {
 	nc             *nats.Conn
 	sub            *nats.Subscription
@@ -45,7 +80,7 @@ type TaskManager struct {
 	stream string
 
 	// manager id, < 0 means auto detect
-	// id int
+	id int
 	// hostname
 	name string
 
@@ -55,14 +90,22 @@ type TaskManager struct {
 	// sends
 	notificationSubjectPrefix string
 
-	// TODO: send org level notification
-	// sendOrgNotification bool
-
 	logErrors bool
 }
 
-func New() *TaskManager {
-	return new(TaskManager)
+func New(nc *nats.Conn, opts Options) *TaskManager {
+	return &TaskManager{
+		nc: nc,
+		//	sub:                       nil,
+		requestTimeout:            opts.RequestTimeout,
+		stream:                    opts.Stream,
+		id:                        opts.Id,
+		name:                      opts.Name,
+		numReplicas:               opts.NumReplicas,
+		numWorkers:                opts.NumWorkers,
+		notificationSubjectPrefix: opts.NotificationSubjectPrefix,
+		logErrors:                 opts.LogErrors,
+	}
 }
 
 func (mgr *TaskManager) Start(ctx context.Context, jsmOpts ...nats.JSOpt) error {
@@ -74,12 +117,21 @@ func (mgr *TaskManager) Start(ctx context.Context, jsmOpts ...nats.JSOpt) error 
 
 	streamInfo, err := jsm.StreamInfo(mgr.stream, jsmOpts...)
 
-	if streamInfo == nil || err != nil && err.Error() == "stream not found" {
+	if streamInfo == nil || err != nil && err.Error() == "nats: stream not found" {
 		_, err = jsm.AddStream(&nats.StreamConfig{
 			Name:     mgr.stream,
 			Subjects: []string{mgr.stream + ".queue.*"},
+			// https://docs.nats.io/nats-concepts/core-nats/queue#stream-as-a-queue
+			Retention:  nats.WorkQueuePolicy,
+			MaxMsgs:    -1,
+			MaxBytes:   -1,
+			Discard:    nats.DiscardOld,
+			MaxAge:     30 * 24 * time.Hour, // 30 days
+			MaxMsgSize: 1 * 1024 * 1024,     // 1 MB
+			Storage:    nats.FileStorage,
+			Replicas:   1, // TODO: configure
+			Duplicates: time.Hour,
 		})
-		// TODO: return error other than stream already exists error
 		if err != nil {
 			return err
 		}
@@ -87,7 +139,7 @@ func (mgr *TaskManager) Start(ctx context.Context, jsmOpts ...nats.JSOpt) error 
 
 	// create nats consumer
 	consumerName := "workers"
-	ackWait := 10 * time.Second // TODO: per task basis?
+	ackWait := 30 * time.Second // TODO: per task basis?
 	ackPolicy := nats.AckExplicitPolicy
 	_, err = jsm.AddConsumer(mgr.stream, &nats.ConsumerConfig{
 		Durable:   consumerName,
@@ -101,6 +153,10 @@ func (mgr *TaskManager) Start(ctx context.Context, jsmOpts ...nats.JSOpt) error 
 		MaxRequestBatch: 1,
 		// max_expires the max amount of time that a pull request with an expires should be allowed to remain active
 		MaxRequestExpires: 1 * time.Second,
+		DeliverPolicy:     nats.DeliverAllPolicy,
+		MaxDeliver:        5,
+		FilterSubject:     "",
+		ReplayPolicy:      nats.ReplayInstantPolicy,
 	})
 	if err != nil {
 		return err
@@ -115,7 +171,7 @@ func (mgr *TaskManager) Start(ctx context.Context, jsmOpts ...nats.JSOpt) error 
 	klog.Info("Starting workers")
 	// Launch two workers to process Foo resources
 	for i := 0; i < mgr.numWorkers; i++ {
-		go wait.Until(mgr.runWorker, time.Second, ctx.Done())
+		go wait.Until(mgr.runWorker, 5*time.Second, ctx.Done())
 	}
 
 	return nil
@@ -135,7 +191,7 @@ func (mgr *TaskManager) runWorker() {
 
 func (mgr *TaskManager) processNextMsg() (err error) {
 	var msgs []*nats.Msg
-	msgs, err = mgr.sub.Fetch(1, nats.MaxWait(100*time.Millisecond))
+	msgs, err = mgr.sub.Fetch(1, nats.MaxWait(50*time.Millisecond))
 	if err != nil {
 		// no more msg to process
 		err = errors.Wrap(err, "failed to fetch msg")
@@ -143,27 +199,27 @@ func (mgr *TaskManager) processNextMsg() (err error) {
 	}
 
 	ev := cloudeventssdk.NewEvent()
-	var rawReq RawTaskRequest
+	var rawReq rawRequest
 	eventDecoded := false
 
 	defer func() {
 		if eventDecoded {
-			if rawReq.Description == "" {
-				rawReq.Description = "Task " + ev.ID()
+			if rawReq.Title == "" {
+				rawReq.Title = "Task " + ev.ID()
 			}
 
-			var status string
-			var seqId int64
+			var msg string
+			var status TaskStatus
 			if err != nil {
-				status = rawReq.Description + " failed!"
-				seqId = 1
+				msg = rawReq.Title + " failed!"
+				status = TaskStatusFailed
 			} else {
-				status = rawReq.Description + " completed successfully!"
-				seqId = 0
+				msg = rawReq.Title + " completed successfully!"
+				status = TaskStatusSuccess
 			}
-			mgr.mustPublish(mgr.respSubject(ev), mgr.newResponse(seqId, status))
+			mgr.mustPublish(mgr.respSubject(ev), mgr.newResponse(status, msg))
 			if mgr.sendNotification(ev) {
-				mgr.mustPublish(mgr.notificationSubj(ev), []byte(status))
+				mgr.mustPublish(mgr.notificationSubj(ev), []byte(msg))
 			}
 		}
 
@@ -191,7 +247,7 @@ func (mgr *TaskManager) processNextMsg() (err error) {
 		loggerOpts = *def.RespLoggerOpts()
 	}
 	logger := funcr.NewJSON(func(obj string) {
-		data := mgr.newResponse(time.Now().UnixMilli(), obj)
+		data := mgr.logResponse(obj)
 		if err := mgr.nc.Publish(mgr.respSubject(ev), data); err != nil && mgr.logErrors {
 			_, _ = fmt.Fprintln(os.Stderr, "failed to publish to nats", err)
 		}
@@ -207,8 +263,8 @@ func (mgr *TaskManager) processNextMsg() (err error) {
 	}
 
 	// report start
-	status := rawReq.Description + " started"
-	mgr.mustPublish(mgr.respSubject(ev), mgr.newResponse(-1, status))
+	status := rawReq.Title + " started!"
+	mgr.mustPublish(mgr.respSubject(ev), mgr.newResponse(TaskStatusStarted, status))
 	if mgr.sendNotification(ev) {
 		mgr.mustPublish(mgr.notificationSubj(ev), []byte(status))
 	}
@@ -217,7 +273,7 @@ func (mgr *TaskManager) processNextMsg() (err error) {
 	{
 		parms := []reflect.Value{
 			reflect.ValueOf(ctx),
-			reflect.ValueOf(data),
+			reflect.ValueOf(data).Elem(),
 		}
 		results := reflect.ValueOf(def.Fn()).Call(parms)
 		fnErr, _ := results[0].Interface().(error)
@@ -231,27 +287,28 @@ func (mgr *TaskManager) processNextMsg() (err error) {
 	return nil
 }
 
-type TaskRequest struct {
-	Description string `json:"d"`
-	Data        any    `json:"data"`
+type request struct {
+	Title string `json:"t"`
+	Data  any    `json:"d"`
 }
 
-type RawTaskRequest struct {
-	Description string          `json:"d"`
-	Data        json.RawMessage `json:"data"`
+type rawRequest struct {
+	Title string          `json:"t"`
+	Data  json.RawMessage `json:"d"`
 }
 
 type TaskResponse struct {
-	Subject string
+	ID      string `json:"id,omitempty"`
+	Subject string `json:"subject,omitempty"`
 }
 
-func (mgr *TaskManager) Submit(t tasks.TaskType, tenantID, msgID, desc string, data any) (*TaskResponse, error) {
-	if msgID == "" {
-		msgID = xid.New().String()
+func (mgr *TaskManager) Submit(t tasks.TaskType, tenantID, taskID, title string, data any) (*TaskResponse, error) {
+	if taskID == "" {
+		taskID = xid.New().String()
 	}
 
 	ev := cloudeventssdk.NewEvent()
-	ev.SetID(msgID) // some id from request body
+	ev.SetID(taskID) // some id from request body
 
 	// /byte.builders/auditor/license_id/feature/info.ProductName/api_group/api_resource/
 	// ref: https://github.com/cloudevents/spec/blob/v1.0.1/spec.md#source-1
@@ -269,25 +326,29 @@ func (mgr *TaskManager) Submit(t tasks.TaskType, tenantID, msgID, desc string, d
 	ev.SetType(string(t))
 	ev.SetTime(time.Now().UTC())
 
-	if err := ev.SetData(cloudeventssdk.ApplicationJSON, TaskRequest{
-		Description: desc,
-		Data:        data,
+	if err := ev.SetData(cloudeventssdk.ApplicationJSON, request{
+		Title: title,
+		Data:  data,
 	}); err != nil {
-		return nil, errors.Wrapf(err, "failed to marshal data into json tenantID=%s msgID=%s taskType=%s", tenantID, msgID, t)
+		return nil, errors.Wrapf(err, "failed to marshal data into json tenantID=%s msgID=%s taskType=%s", tenantID, taskID, t)
 	}
 
 	var msg nats.Msg
 	var err error
 	msg.Subject = mgr.taskSubject(ev)
+	if msg.Header == nil {
+		msg.Header = nats.Header{}
+	}
 	msg.Header.Set(nats.MsgIdHdr, ev.ID())
 	if msg.Data, err = ev.MarshalJSON(); err != nil {
-		return nil, errors.Wrapf(err, "failed to marshal event into json tenantID=%s msgID=%s taskType=%s", tenantID, msgID, t)
+		return nil, errors.Wrapf(err, "failed to marshal event into json tenantID=%s msgID=%s taskType=%s", tenantID, taskID, t)
 	}
 	if _, err = mgr.nc.RequestMsg(&msg, mgr.requestTimeout); err != nil {
-		return nil, errors.Wrapf(err, "failed to submit task tenantID=%s msgID=%s taskType=%s", tenantID, msgID, t)
+		return nil, errors.Wrapf(err, "failed to submit task tenantID=%s msgID=%s taskType=%s", tenantID, taskID, t)
 	}
 
 	return &TaskResponse{
+		ID:      taskID,
 		Subject: mgr.respSubject(ev),
 	}, nil
 }
@@ -297,7 +358,7 @@ func (mgr *TaskManager) taskSubject(ev cloudeventssdk.Event) string {
 }
 
 func (mgr *TaskManager) respSubject(ev cloudeventssdk.Event) string {
-	return fmt.Sprintf("%s.resp.%s.%s.%s", mgr.stream, ev.Subject(), ev.Source(), ev.ID())
+	return fmt.Sprintf("%s.resp.%s.%s", mgr.stream, ev.Subject(), ev.ID())
 }
 
 func (mgr *TaskManager) notificationSubj(ev cloudeventssdk.Event) string {
@@ -314,6 +375,24 @@ func (mgr *TaskManager) mustPublish(subj string, data []byte) {
 	}
 }
 
-func (mgr *TaskManager) newResponse(seqId int64, args string) []byte {
-	return []byte(fmt.Sprintf(`{"seqId":%d,%s`, seqId, args[2:]))
+type TaskStatus string
+
+const (
+	TaskStatusPending = "Pending"
+	TaskStatusStarted = "Started"
+	TaskStatusRunning = "Running"
+	TaskStatusFailed  = "Failed"
+	TaskStatusSuccess = "Success"
+)
+
+func (mgr *TaskManager) newResponse(status TaskStatus, msg string) []byte {
+	data, _ := json.Marshal(map[string]string{
+		"status": string(status),
+		"msg":    msg,
+	})
+	return data
+}
+
+func (mgr *TaskManager) logResponse(args string) []byte {
+	return []byte(fmt.Sprintf(`{"status":%q,%s`, TaskStatusRunning, args[2:]))
 }
