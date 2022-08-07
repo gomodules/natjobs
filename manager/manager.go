@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"os"
 	"reflect"
-	"strings"
 	"time"
 
 	"gomodules.xyz/natjobs/tasks"
@@ -191,8 +190,8 @@ func (mgr *TaskManager) processNextMsg() (err error) {
 	if def.RespLoggerOpts() != nil {
 		loggerOpts = *def.RespLoggerOpts()
 	}
-	logger := funcr.New(func(_, args string) {
-		data := mgr.newResponse(time.Now().UnixMicro(), args)
+	logger := funcr.NewJSON(func(obj string) {
+		data := mgr.newResponse(time.Now().UnixMilli(), obj)
 		if err := mgr.nc.Publish(mgr.respSubject(ev), data); err != nil && mgr.logErrors {
 			_, _ = fmt.Fprintln(os.Stderr, "failed to publish to nats", err)
 		}
@@ -246,7 +245,7 @@ type TaskResponse struct {
 	Subject string
 }
 
-func (mgr *TaskManager) Submit(tenantID string, t tasks.TaskType, msgID, desc string, data any) (*TaskResponse, error) {
+func (mgr *TaskManager) Submit(t tasks.TaskType, tenantID, msgID, desc string, data any) (*TaskResponse, error) {
 	if msgID == "" {
 		msgID = xid.New().String()
 	}
@@ -316,16 +315,5 @@ func (mgr *TaskManager) mustPublish(subj string, data []byte) {
 }
 
 func (mgr *TaskManager) newResponse(seqId int64, args string) []byte {
-	if strings.HasPrefix(args, "{") {
-		return []byte(fmt.Sprintf(`{"seqId": %d, "msg": %s}`, seqId, args))
-	}
-
-	data, err := json.Marshal(map[string]any{
-		"seqId": seqId,
-		"msg":   args,
-	})
-	if err != nil && mgr.logErrors {
-		klog.ErrorS(err, "failed to prepare ")
-	}
-	return data
+	return []byte(fmt.Sprintf(`{"seqId":%d,%s`, seqId, args[2:]))
 }
