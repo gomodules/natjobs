@@ -22,15 +22,3 @@ _testmain.go
 *.exe
 *.test
 *.prof
-.idea/
-dist/
-**/junit.xml
-**/.env
-.vscode/
-coverage.txt
-
-/bin
-/.go
-
-apiserver.local.config/**
-.DS_Store
