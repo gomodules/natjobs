@@ -36,8 +36,8 @@ var (
 
 type TaskDef struct {
 	taskType       TaskType
-	dataType       reflect.Type
 	fn             interface{}
+	dataType       reflect.Type
 	respLoggerOpts *funcr.Options
 }
 
@@ -57,6 +57,9 @@ func (t TaskDef) RespLoggerOpts() *funcr.Options {
 	return t.respLoggerOpts
 }
 
+/*
+fn: func(ctx context.Context, req NON_POINTER_STRUCT) error {...}
+*/
 func Register(t TaskType, fn interface{}, opts ...funcr.Options) error {
 	m.Lock()
 	defer m.Unlock()

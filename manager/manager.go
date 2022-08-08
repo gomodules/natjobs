@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"strings"
 	"time"
 
 	"gomodules.xyz/natjobs/tasks"
@@ -84,8 +85,8 @@ type TaskManager struct {
 	// hostname
 	name string
 
-	numReplicas int
-	numWorkers  int
+	numReplicas          int
+	numWorkersPerReplica int
 
 	// sends
 	notificationSubjectPrefix string
@@ -102,7 +103,7 @@ func New(nc *nats.Conn, opts Options) *TaskManager {
 		id:                        opts.Id,
 		name:                      opts.Name,
 		numReplicas:               opts.NumReplicas,
-		numWorkers:                opts.NumWorkers,
+		numWorkersPerReplica:      opts.NumWorkers,
 		notificationSubjectPrefix: opts.NotificationSubjectPrefix,
 		logErrors:                 opts.LogErrors,
 	}
@@ -120,7 +121,7 @@ func (mgr *TaskManager) Start(ctx context.Context, jsmOpts ...nats.JSOpt) error 
 	if streamInfo == nil || err != nil && err.Error() == "nats: stream not found" {
 		_, err = jsm.AddStream(&nats.StreamConfig{
 			Name:     mgr.stream,
-			Subjects: []string{mgr.stream + ".queue.*"},
+			Subjects: []string{mgr.stream + ".queue.>"},
 			// https://docs.nats.io/nats-concepts/core-nats/queue#stream-as-a-queue
 			Retention:  nats.WorkQueuePolicy,
 			MaxMsgs:    -1,
@@ -148,7 +149,7 @@ func (mgr *TaskManager) Start(ctx context.Context, jsmOpts ...nats.JSOpt) error 
 		// The number of pulls that can be outstanding on a pull consumer, pulls received after this is reached are ignored
 		MaxWaiting: 1,
 		// max working set
-		MaxAckPending: mgr.numWorkers * mgr.numReplicas,
+		MaxAckPending: mgr.numReplicas * mgr.numWorkersPerReplica,
 		// one request per worker
 		MaxRequestBatch: 1,
 		// max_expires the max amount of time that a pull request with an expires should be allowed to remain active
@@ -170,7 +171,7 @@ func (mgr *TaskManager) Start(ctx context.Context, jsmOpts ...nats.JSOpt) error 
 	// start workers
 	klog.Info("Starting workers")
 	// Launch two workers to process Foo resources
-	for i := 0; i < mgr.numWorkers; i++ {
+	for i := 0; i < mgr.numWorkersPerReplica; i++ {
 		go wait.Until(mgr.runWorker, 5*time.Second, ctx.Done())
 	}
 
@@ -181,7 +182,7 @@ func (mgr *TaskManager) runWorker() {
 	for {
 		err := mgr.processNextMsg()
 		if err != nil {
-			if mgr.logErrors {
+			if mgr.logErrors && !strings.Contains(err.Error(), nats.ErrTimeout.Error()) {
 				klog.Errorln(err)
 			}
 			break
@@ -192,18 +193,17 @@ func (mgr *TaskManager) runWorker() {
 func (mgr *TaskManager) processNextMsg() (err error) {
 	var msgs []*nats.Msg
 	msgs, err = mgr.sub.Fetch(1, nats.MaxWait(50*time.Millisecond))
-	if err != nil {
+	if err != nil || len(msgs) == 0 {
 		// no more msg to process
 		err = errors.Wrap(err, "failed to fetch msg")
 		return
 	}
 
-	ev := cloudeventssdk.NewEvent()
+	var ev *cloudeventssdk.Event
 	var rawReq rawRequest
-	eventDecoded := false
 
 	defer func() {
-		if eventDecoded {
+		if ev != nil {
 			if rawReq.Title == "" {
 				rawReq.Title = "Task " + ev.ID()
 			}
@@ -217,9 +217,9 @@ func (mgr *TaskManager) processNextMsg() (err error) {
 				msg = rawReq.Title + " completed successfully!"
 				status = TaskStatusSuccess
 			}
-			mgr.mustPublish(mgr.respSubject(ev), mgr.newResponse(status, msg))
-			if mgr.sendNotification(ev) {
-				mgr.mustPublish(mgr.notificationSubj(ev), []byte(msg))
+			mgr.mustPublish(mgr.respSubject(*ev), mgr.newResponse(status, msg, err))
+			if mgr.sendNotification(*ev) {
+				mgr.mustPublish(mgr.notificationSubj(*ev), []byte(msg))
 			}
 		}
 
@@ -229,18 +229,17 @@ func (mgr *TaskManager) processNextMsg() (err error) {
 		}
 	}()
 
-	err = ev.UnmarshalJSON(msgs[0].Data)
+	newEvent := cloudeventssdk.NewEvent()
+	err = newEvent.UnmarshalJSON(msgs[0].Data)
 	if err != nil {
 		return errors.Wrap(err, "failed to unmarshal event")
 	}
-	eventDecoded = true
+	ev = &newEvent
 
 	def, ok := tasks.Get(tasks.TaskType(ev.Type()))
 	if !ok {
 		return errors.Errorf("No TaskDef registered for task type %s", ev.Type())
 	}
-
-	ctx := context.Background()
 
 	loggerOpts := funcr.Options{}
 	if def.RespLoggerOpts() != nil {
@@ -248,11 +247,11 @@ func (mgr *TaskManager) processNextMsg() (err error) {
 	}
 	logger := funcr.NewJSON(func(obj string) {
 		data := mgr.logResponse(obj)
-		if err := mgr.nc.Publish(mgr.respSubject(ev), data); err != nil && mgr.logErrors {
+		if err := mgr.nc.Publish(mgr.respSubject(*ev), data); err != nil && mgr.logErrors {
 			_, _ = fmt.Fprintln(os.Stderr, "failed to publish to nats", err)
 		}
 	}, loggerOpts)
-	ctx = logr.NewContext(ctx, logger)
+	ctx := logr.NewContext(context.Background(), logger)
 
 	if err = ev.DataAs(&rawReq); err != nil {
 		return errors.Wrap(err, "failed to unmarshal event data")
@@ -264,9 +263,9 @@ func (mgr *TaskManager) processNextMsg() (err error) {
 
 	// report start
 	status := rawReq.Title + " started!"
-	mgr.mustPublish(mgr.respSubject(ev), mgr.newResponse(TaskStatusStarted, status))
-	if mgr.sendNotification(ev) {
-		mgr.mustPublish(mgr.notificationSubj(ev), []byte(status))
+	mgr.mustPublish(mgr.respSubject(*ev), mgr.newResponse(TaskStatusStarted, status, nil))
+	if mgr.sendNotification(*ev) {
+		mgr.mustPublish(mgr.notificationSubj(*ev), []byte(status))
 	}
 
 	// invoke fn
@@ -278,7 +277,7 @@ func (mgr *TaskManager) processNextMsg() (err error) {
 		results := reflect.ValueOf(def.Fn()).Call(parms)
 		fnErr, _ := results[0].Interface().(error)
 		// WARNING: https://stackoverflow.com/a/46275411/244009
-		if fnErr != nil && !reflect.ValueOf(fnErr).IsNil() /*for error wrapper interfaces*/ {
+		if fnErr != nil && !results[0].IsNil() /*for error wrapper interfaces*/ {
 			err = fnErr
 			return
 		}
@@ -385,11 +384,15 @@ const (
 	TaskStatusSuccess = "Success"
 )
 
-func (mgr *TaskManager) newResponse(status TaskStatus, msg string) []byte {
-	data, _ := json.Marshal(map[string]string{
+func (mgr *TaskManager) newResponse(status TaskStatus, msg string, err error) []byte {
+	m := map[string]string{
 		"status": string(status),
 		"msg":    msg,
-	})
+	}
+	if err != nil {
+		m["error"] = err.Error()
+	}
+	data, _ := json.Marshal(m)
 	return data
 }
 
