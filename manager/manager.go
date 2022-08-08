@@ -39,6 +39,7 @@ import (
 
 type Options struct {
 	RequestTimeout time.Duration
+	AckWait        time.Duration
 
 	// same as stream
 	Stream string
@@ -52,9 +53,10 @@ type Options struct {
 	NumWorkers  int
 
 	// sends
+	ResponseSubjectPrefix     string
 	NotificationSubjectPrefix string
 
-	LogErrors bool
+	LogNatsError bool
 }
 
 func DefaultOptions() Options {
@@ -62,13 +64,15 @@ func DefaultOptions() Options {
 
 	return Options{
 		RequestTimeout:            5 * time.Second,
+		AckWait:                   1 * time.Hour,
 		Stream:                    "natjobs",
 		Id:                        1,
 		Name:                      hostname,
 		NumReplicas:               1,
 		NumWorkers:                1,
+		ResponseSubjectPrefix:     "natjobs.resp",
 		NotificationSubjectPrefix: "notifications",
-		LogErrors:                 true,
+		LogNatsError:              true,
 	}
 }
 
@@ -76,6 +80,7 @@ type TaskManager struct {
 	nc             *nats.Conn
 	sub            *nats.Subscription
 	requestTimeout time.Duration
+	ackWait        time.Duration
 
 	// same as stream
 	stream string
@@ -89,9 +94,10 @@ type TaskManager struct {
 	numWorkersPerReplica int
 
 	// sends
+	responseSubjectPrefix     string
 	notificationSubjectPrefix string
 
-	logErrors bool
+	logNatsError bool
 }
 
 func New(nc *nats.Conn, opts Options) *TaskManager {
@@ -99,13 +105,15 @@ func New(nc *nats.Conn, opts Options) *TaskManager {
 		nc: nc,
 		//	sub:                       nil,
 		requestTimeout:            opts.RequestTimeout,
+		ackWait:                   opts.AckWait,
 		stream:                    opts.Stream,
 		id:                        opts.Id,
 		name:                      opts.Name,
 		numReplicas:               opts.NumReplicas,
 		numWorkersPerReplica:      opts.NumWorkers,
+		responseSubjectPrefix:     opts.ResponseSubjectPrefix,
 		notificationSubjectPrefix: opts.NotificationSubjectPrefix,
-		logErrors:                 opts.LogErrors,
+		logNatsError:              opts.LogNatsError,
 	}
 }
 
@@ -121,7 +129,7 @@ func (mgr *TaskManager) Start(ctx context.Context, jsmOpts ...nats.JSOpt) error 
 	if streamInfo == nil || err != nil && err.Error() == "nats: stream not found" {
 		_, err = jsm.AddStream(&nats.StreamConfig{
 			Name:     mgr.stream,
-			Subjects: []string{mgr.stream + ".queue.>"},
+			Subjects: []string{mgr.stream + ".queue.*"},
 			// https://docs.nats.io/nats-concepts/core-nats/queue#stream-as-a-queue
 			Retention:  nats.WorkQueuePolicy,
 			MaxMsgs:    -1,
@@ -140,12 +148,11 @@ func (mgr *TaskManager) Start(ctx context.Context, jsmOpts ...nats.JSOpt) error 
 
 	// create nats consumer
 	consumerName := "workers"
-	ackWait := 30 * time.Second // TODO: per task basis?
 	ackPolicy := nats.AckExplicitPolicy
 	_, err = jsm.AddConsumer(mgr.stream, &nats.ConsumerConfig{
 		Durable:   consumerName,
 		AckPolicy: ackPolicy,
-		AckWait:   ackWait, // TODO: configure ?
+		AckWait:   mgr.ackWait, // TODO: max for any task type
 		// The number of pulls that can be outstanding on a pull consumer, pulls received after this is reached are ignored
 		MaxWaiting: 1,
 		// max working set
@@ -182,7 +189,7 @@ func (mgr *TaskManager) runWorker() {
 	for {
 		err := mgr.processNextMsg()
 		if err != nil {
-			if mgr.logErrors && !strings.Contains(err.Error(), nats.ErrTimeout.Error()) {
+			if mgr.logNatsError && !strings.Contains(err.Error(), nats.ErrTimeout.Error()) {
 				klog.Errorln(err)
 			}
 			break
@@ -200,31 +207,26 @@ func (mgr *TaskManager) processNextMsg() (err error) {
 	}
 
 	var ev *cloudeventssdk.Event
-	var rawReq rawRequest
 
 	defer func() {
 		if ev != nil {
-			if rawReq.Title == "" {
-				rawReq.Title = "Task " + ev.ID()
-			}
-
 			var msg string
 			var status TaskStatus
 			if err != nil {
-				msg = rawReq.Title + " failed!"
+				msg = getTitle(*ev) + " failed!"
 				status = TaskStatusFailed
 			} else {
-				msg = rawReq.Title + " completed successfully!"
+				msg = getTitle(*ev) + " completed successfully!"
 				status = TaskStatusSuccess
 			}
-			mgr.mustPublish(mgr.respSubject(*ev), mgr.newResponse(status, msg, err))
+			mgr.mustPublish(mgr.respSubject(*ev), mgr.newResponse(status, "", msg, err))
 			if mgr.sendNotification(*ev) {
 				mgr.mustPublish(mgr.notificationSubj(*ev), []byte(msg))
 			}
 		}
 
 		// report failure ?
-		if e2 := msgs[0].Ack(); e2 != nil && mgr.logErrors {
+		if e2 := msgs[0].Ack(); e2 != nil && mgr.logNatsError {
 			klog.ErrorS(err, "failed ACK msg", "id", msgs[0].Header.Get(nats.MsgIdHdr))
 		}
 	}()
@@ -247,25 +249,23 @@ func (mgr *TaskManager) processNextMsg() (err error) {
 	}
 	logger := funcr.NewJSON(func(obj string) {
 		data := mgr.logResponse(obj)
-		if err := mgr.nc.Publish(mgr.respSubject(*ev), data); err != nil && mgr.logErrors {
+		if err := mgr.nc.Publish(mgr.respSubject(*ev), data); err != nil && mgr.logNatsError {
 			_, _ = fmt.Fprintln(os.Stderr, "failed to publish to nats", err)
 		}
 	}, loggerOpts)
 	ctx := logr.NewContext(context.Background(), logger)
 
-	if err = ev.DataAs(&rawReq); err != nil {
-		return errors.Wrap(err, "failed to unmarshal event data")
-	}
 	data := def.NewObj()
-	if err = json.Unmarshal(rawReq.Data, data); err != nil {
-		return errors.Wrap(err, "failed to unmarshal request data")
+	if err = ev.DataAs(data); err != nil {
+		return errors.Wrap(err, "failed to unmarshal event data")
 	}
 
 	// report start
-	status := rawReq.Title + " started!"
-	mgr.mustPublish(mgr.respSubject(*ev), mgr.newResponse(TaskStatusStarted, status, nil))
+	title := getTitle(*ev)
+	msg := title + " started!"
+	mgr.mustPublish(mgr.respSubject(*ev), mgr.newResponse(TaskStatusStarted, title, msg, nil))
 	if mgr.sendNotification(*ev) {
-		mgr.mustPublish(mgr.notificationSubj(*ev), []byte(status))
+		mgr.mustPublish(mgr.notificationSubj(*ev), []byte(msg))
 	}
 
 	// invoke fn
@@ -286,22 +286,17 @@ func (mgr *TaskManager) processNextMsg() (err error) {
 	return nil
 }
 
-type request struct {
-	Title string `json:"t"`
-	Data  any    `json:"d"`
-}
-
-type rawRequest struct {
-	Title string          `json:"t"`
-	Data  json.RawMessage `json:"d"`
-}
-
 type TaskResponse struct {
 	ID      string `json:"id,omitempty"`
 	Subject string `json:"subject,omitempty"`
 }
 
-func (mgr *TaskManager) Submit(t tasks.TaskType, tenantID, taskID, title string, data any) (*TaskResponse, error) {
+const (
+	EventExtTitle  = "title"
+	EventExtRespID = "respID"
+)
+
+func (mgr *TaskManager) Submit(t tasks.TaskType, tenantID, taskID, respID, title string, data any) (*TaskResponse, error) {
 	if taskID == "" {
 		taskID = xid.New().String()
 	}
@@ -325,10 +320,10 @@ func (mgr *TaskManager) Submit(t tasks.TaskType, tenantID, taskID, title string,
 	ev.SetType(string(t))
 	ev.SetTime(time.Now().UTC())
 
-	if err := ev.SetData(cloudeventssdk.ApplicationJSON, request{
-		Title: title,
-		Data:  data,
-	}); err != nil {
+	ev.SetExtension(EventExtTitle, title)
+	ev.SetExtension(EventExtRespID, respID)
+
+	if err := ev.SetData(cloudeventssdk.ApplicationJSON, data); err != nil {
 		return nil, errors.Wrapf(err, "failed to marshal data into json tenantID=%s msgID=%s taskType=%s", tenantID, taskID, t)
 	}
 
@@ -357,7 +352,7 @@ func (mgr *TaskManager) taskSubject(ev cloudeventssdk.Event) string {
 }
 
 func (mgr *TaskManager) respSubject(ev cloudeventssdk.Event) string {
-	return fmt.Sprintf("%s.resp.%s.%s", mgr.stream, ev.Subject(), ev.ID())
+	return fmt.Sprintf("%s.%s.%s", mgr.responseSubjectPrefix, ev.Subject(), getRespID(ev))
 }
 
 func (mgr *TaskManager) notificationSubj(ev cloudeventssdk.Event) string {
@@ -369,7 +364,7 @@ func (mgr *TaskManager) sendNotification(ev cloudeventssdk.Event) bool {
 }
 
 func (mgr *TaskManager) mustPublish(subj string, data []byte) {
-	if err := mgr.nc.Publish(subj, data); err != nil && mgr.logErrors {
+	if err := mgr.nc.Publish(subj, data); err != nil && mgr.logNatsError {
 		klog.Errorln(err)
 	}
 }
@@ -384,10 +379,13 @@ const (
 	TaskStatusSuccess = "Success"
 )
 
-func (mgr *TaskManager) newResponse(status TaskStatus, msg string, err error) []byte {
+func (mgr *TaskManager) newResponse(status TaskStatus, phase, msg string, err error) []byte {
 	m := map[string]string{
 		"status": string(status),
 		"msg":    msg,
+	}
+	if phase != "" {
+		m["phase"] = phase
 	}
 	if err != nil {
 		m["error"] = err.Error()
@@ -398,4 +396,20 @@ func (mgr *TaskManager) newResponse(status TaskStatus, msg string, err error) []
 
 func (mgr *TaskManager) logResponse(args string) []byte {
 	return []byte(fmt.Sprintf(`{"status":%q,%s`, TaskStatusRunning, args[2:]))
+}
+
+func getTitle(ev cloudeventssdk.Event) string {
+	var s string
+	if e2 := ev.ExtensionAs(EventExtTitle, &s); e2 != nil {
+		s = "Task " + ev.ID()
+	}
+	return s
+}
+
+func getRespID(ev cloudeventssdk.Event) string {
+	var s string
+	if err := ev.ExtensionAs(EventExtRespID, &s); err != nil {
+		panic(errors.Wrap(err, "event missing "+EventExtRespID))
+	}
+	return s
 }
