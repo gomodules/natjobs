@@ -258,9 +258,9 @@ func (mgr *TaskManager) processNextMsg() (err error) {
 				_, _ = fmt.Fprintln(os.Stderr, "failed to publish to nats", err)
 			}
 		}, loggerOpts)
-		ctx = logr.NewContext(context.Background(), logger)
+		ctx = logr.NewContext(ctx, logger)
 	} else {
-		ctx = logr.NewContext(context.Background(), logr.Discard())
+		ctx = logr.NewContext(ctx, logr.Discard())
 	}
 
 	data := def.NewObj()
