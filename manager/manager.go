@@ -219,7 +219,9 @@ func (mgr *TaskManager) processNextMsg() (err error) {
 				msg = getTitle(*ev) + " completed successfully!"
 				status = TaskStatusSuccess
 			}
-			mgr.mustPublish(mgr.respSubject(*ev), mgr.newResponse(status, "", msg, err))
+			if mgr.sendUpdates(*ev) {
+				mgr.mustPublish(mgr.respSubject(*ev), mgr.newResponse(status, "", msg, err))
+			}
 			if mgr.sendNotification(*ev) {
 				mgr.mustPublish(mgr.notificationSubj(*ev), []byte(msg))
 			}
@@ -247,13 +249,19 @@ func (mgr *TaskManager) processNextMsg() (err error) {
 	if def.RespLoggerOpts() != nil {
 		loggerOpts = *def.RespLoggerOpts()
 	}
-	logger := funcr.NewJSON(func(obj string) {
-		data := mgr.logResponse(obj)
-		if err := mgr.nc.Publish(mgr.respSubject(*ev), data); err != nil && mgr.logNatsError {
-			_, _ = fmt.Fprintln(os.Stderr, "failed to publish to nats", err)
-		}
-	}, loggerOpts)
-	ctx := logr.NewContext(context.Background(), logger)
+
+	ctx := context.Background()
+	if mgr.sendUpdates(*ev) {
+		logger := funcr.NewJSON(func(obj string) {
+			data := mgr.logResponse(obj)
+			if err := mgr.nc.Publish(mgr.respSubject(*ev), data); err != nil && mgr.logNatsError {
+				_, _ = fmt.Fprintln(os.Stderr, "failed to publish to nats", err)
+			}
+		}, loggerOpts)
+		ctx = logr.NewContext(context.Background(), logger)
+	} else {
+		ctx = logr.NewContext(context.Background(), logr.Discard())
+	}
 
 	data := def.NewObj()
 	if err = ev.DataAs(data); err != nil {
@@ -263,7 +271,9 @@ func (mgr *TaskManager) processNextMsg() (err error) {
 	// report start
 	title := getTitle(*ev)
 	msg := title + " started!"
-	mgr.mustPublish(mgr.respSubject(*ev), mgr.newResponse(TaskStatusStarted, title, msg, nil))
+	if mgr.sendUpdates(*ev) {
+		mgr.mustPublish(mgr.respSubject(*ev), mgr.newResponse(TaskStatusStarted, title, msg, nil))
+	}
 	if mgr.sendNotification(*ev) {
 		mgr.mustPublish(mgr.notificationSubj(*ev), []byte(msg))
 	}
@@ -351,8 +361,20 @@ func (mgr *TaskManager) taskSubject(ev cloudeventssdk.Event) string {
 	return fmt.Sprintf("%s.queue.%s", mgr.stream, ev.Subject())
 }
 
+func (mgr *TaskManager) sendUpdates(ev cloudeventssdk.Event) bool {
+	if mgr.responseSubjectPrefix == "" {
+		return false
+	}
+	var s string
+	err := ev.ExtensionAs(EventExtRespID, &s)
+	return err == nil && s != ""
+}
+
 func (mgr *TaskManager) respSubject(ev cloudeventssdk.Event) string {
-	return fmt.Sprintf("%s.%s.%s", mgr.responseSubjectPrefix, ev.Subject(), getRespID(ev))
+	if mgr.sendUpdates(ev) {
+		return fmt.Sprintf("%s.%s.%s", mgr.responseSubjectPrefix, ev.Subject(), getRespID(ev))
+	}
+	return ""
 }
 
 func (mgr *TaskManager) notificationSubj(ev cloudeventssdk.Event) string {
