@@ -417,7 +417,7 @@ func (mgr *TaskManager) newResponse(status TaskStatus, phase, msg string, err er
 }
 
 func (mgr *TaskManager) logResponse(args string) []byte {
-	return []byte(fmt.Sprintf(`{"status":%q,%s`, TaskStatusRunning, args[2:]))
+	return []byte(fmt.Sprintf(`{"status":%q,%s`, TaskStatusRunning, args[1:]))
 }
 
 func getTitle(ev cloudeventssdk.Event) string {
