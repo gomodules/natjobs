@@ -401,13 +401,13 @@ const (
 	TaskStatusSuccess = "Success"
 )
 
-func (mgr *TaskManager) newResponse(status TaskStatus, phase, msg string, err error) []byte {
+func (mgr *TaskManager) newResponse(status TaskStatus, step, msg string, err error) []byte {
 	m := map[string]string{
 		"status": string(status),
 		"msg":    msg,
 	}
-	if phase != "" {
-		m["phase"] = phase
+	if step != "" {
+		m["step"] = step
 	}
 	if err != nil {
 		m["error"] = err.Error()
