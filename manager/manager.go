@@ -22,12 +22,14 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"strconv"
 	"strings"
 	"time"
 
 	"gomodules.xyz/natjobs/tasks"
 
 	cloudeventssdk "github.com/cloudevents/sdk-go/v2"
+	"github.com/cloudevents/sdk-go/v2/types"
 	"github.com/go-logr/logr"
 	"github.com/go-logr/logr/funcr"
 	"github.com/nats-io/nats.go"
@@ -304,9 +306,10 @@ type TaskResponse struct {
 const (
 	EventExtTitle  = "title"
 	EventExtRespID = "respID"
+	EventExtNotify = "notify"
 )
 
-func (mgr *TaskManager) Submit(t tasks.TaskType, tenantID, taskID, respID, title string, data any) (*TaskResponse, error) {
+func (mgr *TaskManager) Submit(t tasks.TaskType, tenantID, taskID, respID, title string, data any, notify bool) (*TaskResponse, error) {
 	if taskID == "" {
 		taskID = xid.New().String()
 	}
@@ -332,6 +335,7 @@ func (mgr *TaskManager) Submit(t tasks.TaskType, tenantID, taskID, respID, title
 
 	ev.SetExtension(EventExtTitle, title)
 	ev.SetExtension(EventExtRespID, respID)
+	ev.SetExtension(EventExtNotify, strconv.FormatBool(notify))
 
 	if err := ev.SetData(cloudeventssdk.ApplicationJSON, data); err != nil {
 		return nil, errors.Wrapf(err, "failed to marshal data into json tenantID=%s msgID=%s taskType=%s", tenantID, taskID, t)
@@ -382,7 +386,11 @@ func (mgr *TaskManager) notificationSubj(ev cloudeventssdk.Event) string {
 }
 
 func (mgr *TaskManager) sendNotification(ev cloudeventssdk.Event) bool {
-	return mgr.notificationSubjectPrefix != "" && ev.Subject() != ""
+	if mgr.notificationSubjectPrefix == "" || ev.Subject() == "" {
+		return false
+	}
+	notify, _ := types.ToBool(ev.Extensions()[EventExtNotify])
+	return notify
 }
 
 func (mgr *TaskManager) mustPublish(subj string, data []byte) {
