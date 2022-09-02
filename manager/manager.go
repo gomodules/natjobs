@@ -223,7 +223,7 @@ func (mgr *TaskManager) processNextMsg() (err error) {
 				mgr.mustPublish(mgr.respSubject(*ev), mgr.newResponse(status, "", msg, err))
 			}
 			if mgr.sendNotification(*ev) {
-				mgr.mustPublish(mgr.notificationSubj(*ev), []byte(msg))
+				mgr.mustPublish(mgr.notificationSubj(*ev), mgr.newResponse(status, "", msg, err))
 			}
 		}
 
@@ -275,7 +275,7 @@ func (mgr *TaskManager) processNextMsg() (err error) {
 		mgr.mustPublish(mgr.respSubject(*ev), mgr.newResponse(TaskStatusStarted, title, msg, nil))
 	}
 	if mgr.sendNotification(*ev) {
-		mgr.mustPublish(mgr.notificationSubj(*ev), []byte(msg))
+		mgr.mustPublish(mgr.notificationSubj(*ev), mgr.newResponse(TaskStatusStarted, title, msg, nil))
 	}
 
 	// invoke fn
