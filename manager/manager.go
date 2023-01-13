@@ -214,6 +214,7 @@ func (mgr *TaskManager) processNextMsg() (err error) {
 		if ev != nil {
 			var msg string
 			var status TaskStatus
+			taskID := getTaskID(*ev)
 			if err != nil {
 				msg = getTitle(*ev) + " failed!"
 				status = TaskStatusFailed
@@ -222,10 +223,10 @@ func (mgr *TaskManager) processNextMsg() (err error) {
 				status = TaskStatusSuccess
 			}
 			if mgr.sendUpdates(*ev) {
-				mgr.mustPublish(mgr.respSubject(*ev), mgr.newResponse(status, "", msg, err))
+				mgr.mustPublish(mgr.respSubject(*ev), mgr.newResponse(status, "", taskID, msg, err))
 			}
 			if mgr.sendNotification(*ev) {
-				mgr.mustPublish(mgr.notificationSubj(*ev), mgr.newResponse(status, "", msg, err))
+				mgr.mustPublish(mgr.notificationSubj(*ev), mgr.newResponse(status, "", taskID, msg, err))
 			}
 		}
 
@@ -273,11 +274,12 @@ func (mgr *TaskManager) processNextMsg() (err error) {
 	// report start
 	title := getTitle(*ev)
 	msg := title + " started!"
+	taskID := getTaskID(*ev)
 	if mgr.sendUpdates(*ev) {
-		mgr.mustPublish(mgr.respSubject(*ev), mgr.newResponse(TaskStatusStarted, title, msg, nil))
+		mgr.mustPublish(mgr.respSubject(*ev), mgr.newResponse(TaskStatusStarted, title, taskID, msg, nil))
 	}
 	if mgr.sendNotification(*ev) {
-		mgr.mustPublish(mgr.notificationSubj(*ev), mgr.newResponse(TaskStatusStarted, title, msg, nil))
+		mgr.mustPublish(mgr.notificationSubj(*ev), mgr.newResponse(TaskStatusStarted, title, taskID, msg, nil))
 	}
 
 	// invoke fn
@@ -305,6 +307,7 @@ type TaskResponse struct {
 
 const (
 	EventExtTitle  = "title"
+	EventExtTaskID = "id"
 	EventExtRespID = "respID"
 	EventExtNotify = "notify"
 )
@@ -334,6 +337,7 @@ func (mgr *TaskManager) Submit(t tasks.TaskType, tenantID, taskID, respID, title
 	ev.SetTime(time.Now().UTC())
 
 	ev.SetExtension(EventExtTitle, title)
+	ev.SetExtension(EventExtTaskID, taskID)
 	ev.SetExtension(EventExtRespID, respID)
 	ev.SetExtension(EventExtNotify, strconv.FormatBool(notify))
 
@@ -409,13 +413,16 @@ const (
 	TaskStatusSuccess = "Success"
 )
 
-func (mgr *TaskManager) newResponse(status TaskStatus, step, msg string, err error) []byte {
+func (mgr *TaskManager) newResponse(status TaskStatus, step, id, msg string, err error) []byte {
 	m := map[string]string{
 		"status": string(status),
 		"msg":    msg,
 	}
 	if step != "" {
 		m["step"] = step
+	}
+	if id != "" {
+		m["id"] = id
 	}
 	if err != nil {
 		m["error"] = err.Error()
@@ -432,6 +439,14 @@ func getTitle(ev cloudeventssdk.Event) string {
 	var s string
 	if e2 := ev.ExtensionAs(EventExtTitle, &s); e2 != nil {
 		s = "Task " + ev.ID()
+	}
+	return s
+}
+
+func getTaskID(ev cloudeventssdk.Event) string {
+	var s string
+	if err := ev.ExtensionAs(EventExtTaskID, &s); err != nil {
+		panic(errors.Wrap(err, "event missing "+EventExtTaskID))
 	}
 	return s
 }
