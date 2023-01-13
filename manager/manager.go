@@ -255,7 +255,7 @@ func (mgr *TaskManager) processNextMsg() (err error) {
 	ctx := context.Background()
 	if mgr.sendUpdates(*ev) {
 		logger := funcr.NewJSON(func(obj string) {
-			data := mgr.logResponse(obj)
+			data := mgr.logResponse(ev.ID(), obj)
 			if err := mgr.nc.Publish(mgr.respSubject(*ev), data); err != nil && mgr.logNatsError {
 				_, _ = fmt.Fprintln(os.Stderr, "failed to publish to nats", err)
 			}
@@ -427,8 +427,8 @@ func (mgr *TaskManager) newResponse(status TaskStatus, step, id, msg string, err
 	return data
 }
 
-func (mgr *TaskManager) logResponse(args string) []byte {
-	return []byte(fmt.Sprintf(`{"status":%q,%s`, TaskStatusRunning, args[1:]))
+func (mgr *TaskManager) logResponse(id, args string) []byte {
+	return []byte(fmt.Sprintf(`{"id":%q,"status":%q,%s`, id, TaskStatusRunning, args[1:]))
 }
 
 func getTitle(ev cloudeventssdk.Event) string {
