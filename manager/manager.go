@@ -222,10 +222,10 @@ func (mgr *TaskManager) processNextMsg() (err error) {
 				status = TaskStatusSuccess
 			}
 			if mgr.sendUpdates(*ev) {
-				mgr.mustPublish(mgr.respSubject(*ev), mgr.newResponse(status, "", ev.ID(), msg, err))
+				mgr.mustPublish(mgr.respSubject(*ev), mgr.newResponse(status, ev.ID(), "", msg, err))
 			}
 			if mgr.sendNotification(*ev) {
-				mgr.mustPublish(mgr.notificationSubj(*ev), mgr.newResponse(status, "", ev.ID(), msg, err))
+				mgr.mustPublish(mgr.notificationSubj(*ev), mgr.newResponse(status, ev.ID(), "", msg, err))
 			}
 		}
 
@@ -274,10 +274,10 @@ func (mgr *TaskManager) processNextMsg() (err error) {
 	title := getTitle(*ev)
 	msg := title + " started!"
 	if mgr.sendUpdates(*ev) {
-		mgr.mustPublish(mgr.respSubject(*ev), mgr.newResponse(TaskStatusStarted, title, ev.ID(), msg, nil))
+		mgr.mustPublish(mgr.respSubject(*ev), mgr.newResponse(TaskStatusStarted, ev.ID(), title, msg, nil))
 	}
 	if mgr.sendNotification(*ev) {
-		mgr.mustPublish(mgr.notificationSubj(*ev), mgr.newResponse(TaskStatusStarted, title, ev.ID(), msg, nil))
+		mgr.mustPublish(mgr.notificationSubj(*ev), mgr.newResponse(TaskStatusStarted, ev.ID(), title, msg, nil))
 	}
 
 	// invoke fn
@@ -409,16 +409,16 @@ const (
 	TaskStatusSuccess = "Success"
 )
 
-func (mgr *TaskManager) newResponse(status TaskStatus, step, id, msg string, err error) []byte {
+func (mgr *TaskManager) newResponse(status TaskStatus, id, step, msg string, err error) []byte {
 	m := map[string]string{
 		"status": string(status),
 		"msg":    msg,
 	}
-	if step != "" {
-		m["step"] = step
-	}
 	if id != "" {
 		m["id"] = id
+	}
+	if step != "" {
+		m["step"] = step
 	}
 	if err != nil {
 		m["error"] = err.Error()
