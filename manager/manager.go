@@ -222,10 +222,10 @@ func (mgr *TaskManager) processNextMsg() (err error) {
 				status = TaskStatusSuccess
 			}
 			if mgr.sendUpdates(*ev) {
-				mgr.mustPublish(mgr.respSubject(*ev), mgr.newResponse(status, "", msg, err))
+				mgr.mustPublish(mgr.respSubject(*ev), mgr.newResponse(status, ev.ID(), "", msg, err))
 			}
 			if mgr.sendNotification(*ev) {
-				mgr.mustPublish(mgr.notificationSubj(*ev), mgr.newResponse(status, "", msg, err))
+				mgr.mustPublish(mgr.notificationSubj(*ev), mgr.newResponse(status, ev.ID(), "", msg, err))
 			}
 		}
 
@@ -255,7 +255,7 @@ func (mgr *TaskManager) processNextMsg() (err error) {
 	ctx := context.Background()
 	if mgr.sendUpdates(*ev) {
 		logger := funcr.NewJSON(func(obj string) {
-			data := mgr.logResponse(obj)
+			data := mgr.logResponse(ev.ID(), obj)
 			if err := mgr.nc.Publish(mgr.respSubject(*ev), data); err != nil && mgr.logNatsError {
 				_, _ = fmt.Fprintln(os.Stderr, "failed to publish to nats", err)
 			}
@@ -274,10 +274,10 @@ func (mgr *TaskManager) processNextMsg() (err error) {
 	title := getTitle(*ev)
 	msg := title + " started!"
 	if mgr.sendUpdates(*ev) {
-		mgr.mustPublish(mgr.respSubject(*ev), mgr.newResponse(TaskStatusStarted, title, msg, nil))
+		mgr.mustPublish(mgr.respSubject(*ev), mgr.newResponse(TaskStatusStarted, ev.ID(), title, msg, nil))
 	}
 	if mgr.sendNotification(*ev) {
-		mgr.mustPublish(mgr.notificationSubj(*ev), mgr.newResponse(TaskStatusStarted, title, msg, nil))
+		mgr.mustPublish(mgr.notificationSubj(*ev), mgr.newResponse(TaskStatusStarted, ev.ID(), title, msg, nil))
 	}
 
 	// invoke fn
@@ -409,10 +409,13 @@ const (
 	TaskStatusSuccess = "Success"
 )
 
-func (mgr *TaskManager) newResponse(status TaskStatus, step, msg string, err error) []byte {
+func (mgr *TaskManager) newResponse(status TaskStatus, id, step, msg string, err error) []byte {
 	m := map[string]string{
 		"status": string(status),
 		"msg":    msg,
+	}
+	if id != "" {
+		m["id"] = id
 	}
 	if step != "" {
 		m["step"] = step
@@ -424,8 +427,8 @@ func (mgr *TaskManager) newResponse(status TaskStatus, step, msg string, err err
 	return data
 }
 
-func (mgr *TaskManager) logResponse(args string) []byte {
-	return []byte(fmt.Sprintf(`{"status":%q,%s`, TaskStatusRunning, args[1:]))
+func (mgr *TaskManager) logResponse(id, args string) []byte {
+	return []byte(fmt.Sprintf(`{"id":%q,"status":%q,%s`, id, TaskStatusRunning, args[1:]))
 }
 
 func getTitle(ev cloudeventssdk.Event) string {
