@@ -162,11 +162,11 @@ func (mgr *TaskManager) Start(ctx context.Context, jsmOpts ...nats.JSOpt) error 
 		// one request per worker
 		MaxRequestBatch: 1,
 		// max_expires the max amount of time that a pull request with an expires should be allowed to remain active
-		MaxRequestExpires: 1 * time.Second,
-		DeliverPolicy:     nats.DeliverAllPolicy,
-		MaxDeliver:        5,
-		FilterSubject:     "",
-		ReplayPolicy:      nats.ReplayInstantPolicy,
+		// MaxRequestExpires: 1 * time.Second,
+		DeliverPolicy: nats.DeliverAllPolicy,
+		MaxDeliver:    5,
+		FilterSubject: "",
+		ReplayPolicy:  nats.ReplayInstantPolicy,
 	})
 	if err != nil {
 		return err
