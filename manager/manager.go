@@ -191,7 +191,7 @@ func (mgr *TaskManager) runWorker() {
 	for {
 		err := mgr.processNextMsg()
 		if err != nil {
-			if mgr.logNatsError && !strings.Contains(err.Error(), nats.ErrTimeout.Error()) {
+			if mgr.logNatsError && !(strings.Contains(err.Error(), nats.ErrTimeout.Error()) || strings.Contains(err.Error(), "nats: Exceeded MaxWaiting")) {
 				klog.Errorln(err)
 			}
 			break
