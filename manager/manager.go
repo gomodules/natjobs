@@ -33,6 +33,7 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/go-logr/logr/funcr"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"github.com/pkg/errors"
 	"github.com/rs/xid"
 	"gomodules.xyz/wait"
@@ -80,7 +81,7 @@ func DefaultOptions() Options {
 
 type TaskManager struct {
 	nc             *nats.Conn
-	sub            *nats.Subscription
+	workerConsumer jetstream.Consumer
 	requestTimeout time.Duration
 	ackWait        time.Duration
 
@@ -104,8 +105,7 @@ type TaskManager struct {
 
 func New(nc *nats.Conn, opts Options) *TaskManager {
 	return &TaskManager{
-		nc: nc,
-		//	sub:                       nil,
+		nc:                        nc,
 		requestTimeout:            opts.RequestTimeout,
 		ackWait:                   opts.AckWait,
 		stream:                    opts.Stream,
@@ -120,26 +120,24 @@ func New(nc *nats.Conn, opts Options) *TaskManager {
 }
 
 func (mgr *TaskManager) Start(ctx context.Context, jsmOpts ...nats.JSOpt) error {
-	// create stream
-	jsm, err := mgr.nc.JetStream(jsmOpts...)
+	jsm, err := jetstream.New(mgr.nc)
 	if err != nil {
 		return err
 	}
 
-	streamInfo, err := jsm.StreamInfo(mgr.stream, jsmOpts...)
-
-	if streamInfo == nil || err != nil && err.Error() == "nats: stream not found" {
-		_, err = jsm.AddStream(&nats.StreamConfig{
+	stream, err := jsm.Stream(ctx, mgr.stream)
+	if stream == nil || err != nil && err.Error() == "nats: stream not found" {
+		_, err = jsm.CreateStream(ctx, jetstream.StreamConfig{
 			Name:     mgr.stream,
 			Subjects: []string{mgr.stream + ".queue.*"},
 			// https://docs.nats.io/nats-concepts/core-nats/queue#stream-as-a-queue
-			Retention:  nats.WorkQueuePolicy,
+			Retention:  jetstream.WorkQueuePolicy,
 			MaxMsgs:    -1,
 			MaxBytes:   -1,
-			Discard:    nats.DiscardOld,
+			Discard:    jetstream.DiscardOld,
 			MaxAge:     30 * 24 * time.Hour, // 30 days
 			MaxMsgSize: 1 * 1024 * 1024,     // 1 MB
-			Storage:    nats.FileStorage,
+			Storage:    jetstream.FileStorage,
 			Replicas:   1, // TODO: configure
 			Duplicates: time.Hour,
 		})
@@ -150,10 +148,9 @@ func (mgr *TaskManager) Start(ctx context.Context, jsmOpts ...nats.JSOpt) error 
 
 	// create nats consumer
 	consumerName := "workers"
-	ackPolicy := nats.AckExplicitPolicy
-	_, err = jsm.AddConsumer(mgr.stream, &nats.ConsumerConfig{
+	consumer, err := jsm.CreateConsumer(ctx, mgr.stream, jetstream.ConsumerConfig{
 		Durable:   consumerName,
-		AckPolicy: ackPolicy,
+		AckPolicy: jetstream.AckExplicitPolicy,
 		AckWait:   mgr.ackWait, // TODO: max for any task type
 		// The number of pulls that can be outstanding on a pull consumer, pulls received after this is reached are ignored
 		MaxWaiting: 1,
@@ -163,23 +160,18 @@ func (mgr *TaskManager) Start(ctx context.Context, jsmOpts ...nats.JSOpt) error 
 		MaxRequestBatch: 1,
 		// max_expires the max amount of time that a pull request with an expires should be allowed to remain active
 		// MaxRequestExpires: 1 * time.Second,
-		DeliverPolicy: nats.DeliverAllPolicy,
+		DeliverPolicy: jetstream.DeliverAllPolicy,
 		MaxDeliver:    5,
 		FilterSubject: "",
-		ReplayPolicy:  nats.ReplayInstantPolicy,
+		ReplayPolicy:  jetstream.ReplayInstantPolicy,
 	})
 	if err != nil {
 		return err
 	}
-	sub, err := jsm.PullSubscribe("", consumerName, nats.Bind(mgr.stream, consumerName))
-	if err != nil {
-		return err
-	}
-	mgr.sub = sub
+	mgr.workerConsumer = consumer
 
-	// start workers
 	klog.Info("Starting workers")
-	// Launch two workers to process Foo resources
+	// Launch workers to process and proxy the message to relevant subject from nats subject
 	for i := 0; i < mgr.numWorkersPerReplica; i++ {
 		go wait.Until(mgr.runWorker, 5*time.Second, ctx.Done())
 	}
@@ -200,9 +192,8 @@ func (mgr *TaskManager) runWorker() {
 }
 
 func (mgr *TaskManager) processNextMsg() (err error) {
-	var msgs []*nats.Msg
-	msgs, err = mgr.sub.Fetch(1, nats.MaxWait(50*time.Millisecond))
-	if err != nil || len(msgs) == 0 {
+	msg, err := mgr.workerConsumer.Next(jetstream.FetchMaxWait(time.Millisecond * 50))
+	if err != nil || msg == nil {
 		// no more msg to process
 		err = errors.Wrap(err, "failed to fetch msg")
 		return
@@ -230,13 +221,13 @@ func (mgr *TaskManager) processNextMsg() (err error) {
 		}
 
 		// report failure ?
-		if e2 := msgs[0].Ack(); e2 != nil && mgr.logNatsError {
-			klog.ErrorS(err, "failed ACK msg", "id", msgs[0].Header.Get(nats.MsgIdHdr))
+		if e2 := msg.Ack(); e2 != nil && mgr.logNatsError {
+			klog.ErrorS(err, "failed ACK msg", "id", msg.Headers().Get(nats.MsgIdHdr))
 		}
 	}()
 
 	newEvent := cloudeventssdk.NewEvent()
-	err = newEvent.UnmarshalJSON(msgs[0].Data)
+	err = newEvent.UnmarshalJSON(msg.Data())
 	if err != nil {
 		return errors.Wrap(err, "failed to unmarshal event")
 	}
@@ -272,12 +263,12 @@ func (mgr *TaskManager) processNextMsg() (err error) {
 
 	// report start
 	title := getTitle(*ev)
-	msg := title + " started!"
+	msgTitle := title + " started!"
 	if mgr.sendUpdates(*ev) {
-		mgr.mustPublish(mgr.respSubject(*ev), mgr.newResponse(TaskStatusStarted, ev.ID(), title, msg, nil))
+		mgr.mustPublish(mgr.respSubject(*ev), mgr.newResponse(TaskStatusStarted, ev.ID(), title, msgTitle, nil))
 	}
 	if mgr.sendNotification(*ev) {
-		mgr.mustPublish(mgr.notificationSubj(*ev), mgr.newResponse(TaskStatusStarted, ev.ID(), title, msg, nil))
+		mgr.mustPublish(mgr.notificationSubj(*ev), mgr.newResponse(TaskStatusStarted, ev.ID(), title, msgTitle, nil))
 	}
 
 	// invoke fn
