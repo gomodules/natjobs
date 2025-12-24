@@ -46,7 +46,7 @@ github.com/nats-io/nats.go/encoders/builtin
 github.com/nats-io/nats.go/internal/parser
 github.com/nats-io/nats.go/jetstream
 github.com/nats-io/nats.go/util
-# github.com/nats-io/nkeys v0.4.5
+# github.com/nats-io/nkeys v0.4.6
 ## explicit; go 1.19
 github.com/nats-io/nkeys
 # github.com/nats-io/nuid v1.0.1
@@ -72,7 +72,7 @@ go.uber.org/zap/internal/bufferpool
 go.uber.org/zap/internal/color
 go.uber.org/zap/internal/exit
 go.uber.org/zap/zapcore
-# golang.org/x/crypto v0.6.0
+# golang.org/x/crypto v0.14.0
 ## explicit; go 1.17
 golang.org/x/crypto/blake2b
 golang.org/x/crypto/curve25519
@@ -83,10 +83,10 @@ golang.org/x/crypto/internal/poly1305
 golang.org/x/crypto/nacl/box
 golang.org/x/crypto/nacl/secretbox
 golang.org/x/crypto/salsa20/salsa
-# golang.org/x/sys v0.5.0
+# golang.org/x/sys v0.13.0
 ## explicit; go 1.17
 golang.org/x/sys/cpu
-# golang.org/x/text v0.7.0
+# golang.org/x/text v0.13.0
 ## explicit; go 1.17
 golang.org/x/text/cases
 golang.org/x/text/internal
