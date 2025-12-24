@@ -3,7 +3,7 @@ module gomodules.xyz/natjobs
 go 1.18
 
 require (
-	github.com/cloudevents/sdk-go/v2 v2.13.0
+	github.com/cloudevents/sdk-go/v2 v2.15.2
 	github.com/go-logr/logr v1.2.3
 	github.com/nats-io/nats.go v1.30.2
 	github.com/pkg/errors v0.9.1
