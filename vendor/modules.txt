@@ -104,8 +104,8 @@ gomodules.xyz/clock
 # gomodules.xyz/wait v0.2.0
 ## explicit; go 1.14
 gomodules.xyz/wait
-# google.golang.org/protobuf v1.28.1
-## explicit; go 1.11
+# google.golang.org/protobuf v1.33.0
+## explicit; go 1.17
 # gopkg.in/yaml.v2 v2.4.0
 ## explicit; go 1.15
 # k8s.io/klog/v2 v2.80.1
