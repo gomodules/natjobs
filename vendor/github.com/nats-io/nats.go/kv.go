@@ -1,4 +1,4 @@
-// Copyright 2021-2022 The NATS Authors
+// Copyright 2021-2023 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -54,6 +54,7 @@ type KeyValue interface {
 	// Create will add the key/value pair iff it does not exist.
 	Create(key string, value []byte) (revision uint64, err error)
 	// Update will update the value iff the latest revision matches.
+	// Update also resets the TTL associated with the key (if any).
 	Update(key string, value []byte, last uint64) (revision uint64, err error)
 	// Delete will place a delete marker and leave all revisions.
 	Delete(key string, opts ...DeleteOpt) error
@@ -64,8 +65,14 @@ type KeyValue interface {
 	Watch(keys string, opts ...WatchOpt) (KeyWatcher, error)
 	// WatchAll will invoke the callback for all updates.
 	WatchAll(opts ...WatchOpt) (KeyWatcher, error)
+	// WatchFiltered will watch for any updates to keys that match the keys
+	// argument. It can be configured with the same options as Watch.
+	WatchFiltered(keys []string, opts ...WatchOpt) (KeyWatcher, error)
 	// Keys will return all keys.
+	// Deprecated: Use ListKeys instead to avoid memory issues.
 	Keys(opts ...WatchOpt) ([]string, error)
+	// ListKeys will return all keys in a channel.
+	ListKeys(opts ...WatchOpt) (KeyLister, error)
 	// History will return all historical values for the key.
 	History(key string, opts ...WatchOpt) ([]KeyValueEntry, error)
 	// Bucket returns the current bucket name.
@@ -95,6 +102,9 @@ type KeyValueStatus interface {
 
 	// Bytes returns the size in bytes of the bucket
 	Bytes() uint64
+
+	// IsCompressed indicates if the data is compressed on disk
+	IsCompressed() bool
 }
 
 // KeyWatcher is what is returned when doing a watch.
@@ -105,6 +115,22 @@ type KeyWatcher interface {
 	Updates() <-chan KeyValueEntry
 	// Stop will stop this watcher.
 	Stop() error
+	// Error returns a channel that will receive any error that occurs during
+	// watching. In particular, this will receive an error if the watcher times
+	// out while expecting more initial keys. The channel is closed when the
+	// watch operation completes or when Stop() is called.
+	Error() <-chan error
+}
+
+// KeyLister is used to retrieve a list of key value store keys
+type KeyLister interface {
+	Keys() <-chan string
+	Stop() error
+	// Error returns a channel that will receive any error that occurs during
+	// key listing. In particular, this will receive an error if the underlying
+	// watcher times out while expecting more keys. The channel is closed when
+	// the listing operation completes or when Stop() is called.
+	Error() <-chan error
 }
 
 type WatchOpt interface {
@@ -237,18 +263,22 @@ func purge() DeleteOpt {
 
 // KeyValueConfig is for configuring a KeyValue store.
 type KeyValueConfig struct {
-	Bucket       string
-	Description  string
-	MaxValueSize int32
-	History      uint8
-	TTL          time.Duration
-	MaxBytes     int64
-	Storage      StorageType
-	Replicas     int
-	Placement    *Placement
-	RePublish    *RePublish
-	Mirror       *StreamSource
-	Sources      []*StreamSource
+	Bucket       string          `json:"bucket"`
+	Description  string          `json:"description,omitempty"`
+	MaxValueSize int32           `json:"max_value_size,omitempty"`
+	History      uint8           `json:"history,omitempty"`
+	TTL          time.Duration   `json:"ttl,omitempty"`
+	MaxBytes     int64           `json:"max_bytes,omitempty"`
+	Storage      StorageType     `json:"storage,omitempty"`
+	Replicas     int             `json:"num_replicas,omitempty"`
+	Placement    *Placement      `json:"placement,omitempty"`
+	RePublish    *RePublish      `json:"republish,omitempty"`
+	Mirror       *StreamSource   `json:"mirror,omitempty"`
+	Sources      []*StreamSource `json:"sources,omitempty"`
+
+	// Enable underlying stream compression.
+	// NOTE: Compression is supported for nats-server 2.10.0+
+	Compression bool `json:"compression,omitempty"`
 }
 
 // Used to watch all keys.
@@ -311,6 +341,7 @@ var (
 	ErrKeyDeleted             = errors.New("nats: key was deleted")
 	ErrHistoryToLarge         = errors.New("nats: history limited to a max of 64")
 	ErrNoKeysFound            = errors.New("nats: no keys found")
+	ErrKeyWatcherTimeout      = errors.New("nats: key watcher timed out waiting for initial keys")
 )
 
 var (
@@ -323,13 +354,13 @@ const (
 	kvSubjectsTmpl          = "$KV.%s.>"
 	kvSubjectsPreTmpl       = "$KV.%s."
 	kvSubjectsPreDomainTmpl = "%s.$KV.%s."
-	kvNoPending             = "0"
 )
 
 // Regex for valid keys and buckets.
 var (
-	validBucketRe = regexp.MustCompile(`\A[a-zA-Z0-9_-]+\z`)
-	validKeyRe    = regexp.MustCompile(`\A[-/_=\.a-zA-Z0-9]+\z`)
+	validBucketRe    = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+	validKeyRe       = regexp.MustCompile(`^[-/_=\.a-zA-Z0-9]+$`)
+	validSearchKeyRe = regexp.MustCompile(`^[-/_=\.a-zA-Z0-9*]*[>]?$`)
 )
 
 // KeyValue will lookup and bind to an existing KeyValue store.
@@ -337,13 +368,13 @@ func (js *js) KeyValue(bucket string) (KeyValue, error) {
 	if !js.nc.serverMinVersion(2, 6, 2) {
 		return nil, errors.New("nats: key-value requires at least server version 2.6.2")
 	}
-	if !validBucketRe.MatchString(bucket) {
+	if !bucketValid(bucket) {
 		return nil, ErrInvalidBucketName
 	}
 	stream := fmt.Sprintf(kvBucketNameTmpl, bucket)
 	si, err := js.StreamInfo(stream)
 	if err != nil {
-		if err == ErrStreamNotFound {
+		if errors.Is(err, ErrStreamNotFound) {
 			err = ErrBucketNotFound
 		}
 		return nil, err
@@ -365,7 +396,7 @@ func (js *js) CreateKeyValue(cfg *KeyValueConfig) (KeyValue, error) {
 	if cfg == nil {
 		return nil, ErrKeyValueConfigRequired
 	}
-	if !validBucketRe.MatchString(cfg.Bucket) {
+	if !bucketValid(cfg.Bucket) {
 		return nil, ErrInvalidBucketName
 	}
 	if _, err := js.AccountInfo(); err != nil {
@@ -405,6 +436,10 @@ func (js *js) CreateKeyValue(cfg *KeyValueConfig) (KeyValue, error) {
 	if cfg.TTL > 0 && cfg.TTL < duplicateWindow {
 		duplicateWindow = cfg.TTL
 	}
+	var compression StoreCompression
+	if cfg.Compression {
+		compression = S2Compression
+	}
 	scfg := &StreamConfig{
 		Name:              fmt.Sprintf(kvBucketNameTmpl, cfg.Bucket),
 		Description:       cfg.Description,
@@ -422,6 +457,7 @@ func (js *js) CreateKeyValue(cfg *KeyValueConfig) (KeyValue, error) {
 		MaxConsumers:      -1,
 		AllowDirect:       true,
 		RePublish:         cfg.RePublish,
+		Compression:       compression,
 	}
 	if cfg.Mirror != nil {
 		// Copy in case we need to make changes so we do not change caller's version.
@@ -465,7 +501,7 @@ func (js *js) CreateKeyValue(cfg *KeyValueConfig) (KeyValue, error) {
 		// the stream.
 		// The same logic applies for KVs created pre 2.9.x and
 		// the AllowDirect setting.
-		if err == ErrStreamNameAlreadyInUse {
+		if errors.Is(err, ErrStreamNameAlreadyInUse) {
 			if si, _ = js.StreamInfo(scfg.Name); si != nil {
 				// To compare, make the server's stream info discard
 				// policy same than ours.
@@ -486,7 +522,7 @@ func (js *js) CreateKeyValue(cfg *KeyValueConfig) (KeyValue, error) {
 
 // DeleteKeyValue will delete this KeyValue store (JetStream stream).
 func (js *js) DeleteKeyValue(bucket string) error {
-	if !validBucketRe.MatchString(bucket) {
+	if !bucketValid(bucket) {
 		return ErrInvalidBucketName
 	}
 	stream := fmt.Sprintf(kvBucketNameTmpl, bucket)
@@ -526,6 +562,13 @@ func (e *kve) Created() time.Time    { return e.created }
 func (e *kve) Delta() uint64         { return e.delta }
 func (e *kve) Operation() KeyValueOp { return e.op }
 
+func bucketValid(bucket string) bool {
+	if len(bucket) == 0 {
+		return false
+	}
+	return validBucketRe.MatchString(bucket)
+}
+
 func keyValid(key string) bool {
 	if len(key) == 0 || key[0] == '.' || key[len(key)-1] == '.' {
 		return false
@@ -533,11 +576,18 @@ func keyValid(key string) bool {
 	return validKeyRe.MatchString(key)
 }
 
+func searchKeyValid(key string) bool {
+	if len(key) == 0 || key[0] == '.' || key[len(key)-1] == '.' {
+		return false
+	}
+	return validSearchKeyRe.MatchString(key)
+}
+
 // Get returns the latest value for the key.
 func (kv *kvs) Get(key string) (KeyValueEntry, error) {
 	e, err := kv.get(key, kvLatestRevision)
 	if err != nil {
-		if err == ErrKeyDeleted {
+		if errors.Is(err, ErrKeyDeleted) {
 			return nil, ErrKeyNotFound
 		}
 		return nil, err
@@ -550,7 +600,7 @@ func (kv *kvs) Get(key string) (KeyValueEntry, error) {
 func (kv *kvs) GetRevision(key string, revision uint64) (KeyValueEntry, error) {
 	e, err := kv.get(key, revision)
 	if err != nil {
-		if err == ErrKeyDeleted {
+		if errors.Is(err, ErrKeyDeleted) {
 			return nil, ErrKeyNotFound
 		}
 		return nil, err
@@ -587,7 +637,7 @@ func (kv *kvs) get(key string, revision uint64) (KeyValueEntry, error) {
 		}
 	}
 	if err != nil {
-		if err == ErrMsgNotFound {
+		if errors.Is(err, ErrMsgNotFound) {
 			err = ErrKeyNotFound
 		}
 		return nil, err
@@ -654,7 +704,7 @@ func (kv *kvs) Create(key string, value []byte) (revision uint64, err error) {
 
 	// TODO(dlc) - Since we have tombstones for DEL ops for watchers, this could be from that
 	// so we need to double check.
-	if e, err := kv.get(key, kvLatestRevision); err == ErrKeyDeleted {
+	if e, err := kv.get(key, kvLatestRevision); errors.Is(err, ErrKeyDeleted) {
 		return kv.Update(key, value, e.Revision())
 	}
 
@@ -786,12 +836,18 @@ func (kv *kvs) PurgeDeletes(opts ...PurgeOpt) error {
 			deleteMarkers = append(deleteMarkers, entry)
 		}
 	}
+	// Stop watcher here so as we purge we do not have the system continually updating numPending.
+	watcher.Stop()
 
 	var (
 		pr StreamPurgeRequest
 		b  strings.Builder
 	)
 	// Do actual purges here.
+	purgeOpts := []JSOpt{}
+	if o.ctx != nil {
+		purgeOpts = append(purgeOpts, Context(o.ctx))
+	}
 	for _, entry := range deleteMarkers {
 		b.WriteString(kv.pre)
 		b.WriteString(entry.Key())
@@ -800,7 +856,7 @@ func (kv *kvs) PurgeDeletes(opts ...PurgeOpt) error {
 		if olderThan > 0 && entry.Created().After(limit) {
 			pr.Keep = 1
 		}
-		if err := kv.js.purgeStream(kv.stream, &pr); err != nil {
+		if err := kv.js.purgeStream(kv.stream, &pr, purgeOpts...); err != nil {
 			return err
 		}
 		b.Reset()
@@ -830,6 +886,45 @@ func (kv *kvs) Keys(opts ...WatchOpt) ([]string, error) {
 	return keys, nil
 }
 
+type keyLister struct {
+	watcher KeyWatcher
+	keys    chan string
+}
+
+// ListKeys will return all keys.
+func (kv *kvs) ListKeys(opts ...WatchOpt) (KeyLister, error) {
+	opts = append(opts, IgnoreDeletes(), MetaOnly())
+	watcher, err := kv.WatchAll(opts...)
+	if err != nil {
+		return nil, err
+	}
+	kl := &keyLister{watcher: watcher, keys: make(chan string, 256)}
+
+	go func() {
+		defer close(kl.keys)
+		defer watcher.Stop()
+		for entry := range watcher.Updates() {
+			if entry == nil {
+				return
+			}
+			kl.keys <- entry.Key()
+		}
+	}()
+	return kl, nil
+}
+
+func (kl *keyLister) Keys() <-chan string {
+	return kl.keys
+}
+
+func (kl *keyLister) Stop() error {
+	return kl.watcher.Stop()
+}
+
+func (kl *keyLister) Error() <-chan error {
+	return kl.watcher.Error()
+}
+
 // History will return all values for the key.
 func (kv *kvs) History(key string, opts ...WatchOpt) ([]KeyValueEntry, error) {
 	opts = append(opts, IncludeHistory())
@@ -854,13 +949,15 @@ func (kv *kvs) History(key string, opts ...WatchOpt) ([]KeyValueEntry, error) {
 
 // Implementation for Watch
 type watcher struct {
-	mu          sync.Mutex
-	updates     chan KeyValueEntry
-	sub         *Subscription
-	initDone    bool
-	initPending uint64
-	received    uint64
-	ctx         context.Context
+	mu            sync.Mutex
+	updates       chan KeyValueEntry
+	sub           *Subscription
+	initDone      bool
+	initPending   uint64
+	received      uint64
+	ctx           context.Context
+	initDoneTimer *time.Timer
+	errCh         chan error
 }
 
 // Context returns the context for the watcher if set.
@@ -887,14 +984,27 @@ func (w *watcher) Stop() error {
 	return w.sub.Unsubscribe()
 }
 
+// Error returns a channel that will receive any error that occurs during watching.
+func (w *watcher) Error() <-chan error {
+	if w == nil {
+		closedCh := make(chan error)
+		close(closedCh)
+		return closedCh
+	}
+	return w.errCh
+}
+
 // WatchAll watches all keys.
 func (kv *kvs) WatchAll(opts ...WatchOpt) (KeyWatcher, error) {
 	return kv.Watch(AllKeys, opts...)
 }
 
-// Watch will fire the callback when a key that matches the keys pattern is updated.
-// keys needs to be a valid NATS subject.
-func (kv *kvs) Watch(keys string, opts ...WatchOpt) (KeyWatcher, error) {
+func (kv *kvs) WatchFiltered(keys []string, opts ...WatchOpt) (KeyWatcher, error) {
+	for _, key := range keys {
+		if !searchKeyValid(key) {
+			return nil, fmt.Errorf("%w: %s", ErrInvalidKey, "key cannot be empty and must be a valid NATS subject")
+		}
+	}
 	var o watchOpts
 	for _, opt := range opts {
 		if opt != nil {
@@ -905,13 +1015,27 @@ func (kv *kvs) Watch(keys string, opts ...WatchOpt) (KeyWatcher, error) {
 	}
 
 	// Could be a pattern so don't check for validity as we normally do.
-	var b strings.Builder
-	b.WriteString(kv.pre)
-	b.WriteString(keys)
-	keys = b.String()
+	for i, key := range keys {
+		var b strings.Builder
+		b.WriteString(kv.pre)
+		b.WriteString(key)
+		keys[i] = b.String()
+	}
+
+	// if no keys are provided, watch all keys
+	if len(keys) == 0 {
+		var b strings.Builder
+		b.WriteString(kv.pre)
+		b.WriteString(AllKeys)
+		keys = []string{b.String()}
+	}
 
 	// We will block below on placing items on the chan. That is by design.
-	w := &watcher{updates: make(chan KeyValueEntry, 256), ctx: o.ctx}
+	w := &watcher{
+		updates: make(chan KeyValueEntry, 256),
+		ctx:     o.ctx,
+		errCh:   make(chan error, 1),
+	}
 
 	update := func(m *Msg) {
 		tokens, err := parser.GetMetadataFields(m.Reply)
@@ -951,13 +1075,17 @@ func (kv *kvs) Watch(keys string, opts ...WatchOpt) (KeyWatcher, error) {
 		// Skip if UpdatesOnly() is set, since there will never be updates initially.
 		if !w.initDone {
 			w.received++
-			// We set this on the first trip through..
-			if w.initPending == 0 {
-				w.initPending = delta
-			}
-			if w.received > w.initPending || delta == 0 {
+			// Use the stable initPending value set at consumer creation.
+			// We're done if we've received all expected messages OR there are no more pending
+			if w.received >= w.initPending || delta == 0 {
+				// Avoid possible race setting up timer.
+				if w.initDoneTimer != nil {
+					w.initDoneTimer.Stop()
+				}
 				w.initDone = true
 				w.updates <- nil
+			} else if w.initDoneTimer != nil {
+				w.initDoneTimer.Reset(kv.js.opts.wait)
 			}
 		}
 	}
@@ -981,7 +1109,14 @@ func (kv *kvs) Watch(keys string, opts ...WatchOpt) (KeyWatcher, error) {
 	// update() callback.
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	sub, err := kv.js.Subscribe(keys, update, subOpts...)
+	var sub *Subscription
+	var err error
+	if len(keys) == 1 {
+		sub, err = kv.js.Subscribe(keys[0], update, subOpts...)
+	} else {
+		subOpts = append(subOpts, ConsumerFilterSubjects(keys...))
+		sub, err = kv.js.Subscribe("", update, subOpts...)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -990,9 +1125,26 @@ func (kv *kvs) Watch(keys string, opts ...WatchOpt) (KeyWatcher, error) {
 	// of the consumer, send the marker.
 	// Skip if UpdatesOnly() is set, since there will never be updates initially.
 	if !o.updatesOnly {
-		if sub.jsi != nil && sub.jsi.pending == 0 {
-			w.initDone = true
-			w.updates <- nil
+		if sub.jsi != nil {
+			if sub.jsi.pending == 0 {
+				w.initDone = true
+				w.updates <- nil
+			} else {
+				w.initPending = sub.jsi.pending
+				// Set a timer to send the marker if we do not get any messages.
+				w.initDoneTimer = time.AfterFunc(kv.js.opts.wait, func() {
+					w.mu.Lock()
+					defer w.mu.Unlock()
+					if !w.initDone {
+						w.initDone = true
+						select {
+						case w.errCh <- ErrKeyWatcherTimeout:
+						default:
+						}
+						w.updates <- nil
+					}
+				})
+			}
 		}
 	} else {
 		// if UpdatesOnly was used, mark initialization as complete
@@ -1000,12 +1152,25 @@ func (kv *kvs) Watch(keys string, opts ...WatchOpt) (KeyWatcher, error) {
 	}
 	// Set us up to close when the waitForMessages func returns.
 	sub.pDone = func(_ string) {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		if w.initDoneTimer != nil {
+			w.initDoneTimer.Stop()
+		}
 		close(w.updates)
+		close(w.errCh)
 	}
+
 	sub.mu.Unlock()
 
 	w.sub = sub
 	return w, nil
+}
+
+// Watch will fire the callback when a key that matches the keys pattern is updated.
+// keys needs to be a valid NATS subject.
+func (kv *kvs) Watch(keys string, opts ...WatchOpt) (KeyWatcher, error) {
+	return kv.WatchFiltered([]string{keys}, opts...)
 }
 
 // Bucket returns the current bucket name (JetStream stream).
@@ -1040,6 +1205,9 @@ func (s *KeyValueBucketStatus) StreamInfo() *StreamInfo { return s.nfo }
 // Bytes is the size of the stream
 func (s *KeyValueBucketStatus) Bytes() uint64 { return s.nfo.State.Bytes }
 
+// IsCompressed indicates if the data is compressed on disk
+func (s *KeyValueBucketStatus) IsCompressed() bool { return s.nfo.Config.Compression != NoCompression }
+
 // Status retrieves the status and configuration of a bucket
 func (kv *kvs) Status() (KeyValueStatus, error) {
 	nfo, err := kv.js.StreamInfo(kv.stream)
@@ -1062,7 +1230,7 @@ func (js *js) KeyValueStoreNames() <-chan string {
 				if !strings.HasPrefix(name, kvBucketNamePre) {
 					continue
 				}
-				ch <- name
+				ch <- strings.TrimPrefix(name, kvBucketNamePre)
 			}
 		}
 	}()
