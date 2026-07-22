@@ -24,6 +24,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"gomodules.xyz/natjobs/tasks"
@@ -101,6 +102,21 @@ type TaskManager struct {
 	notificationSubjectPrefix string
 
 	logNatsError bool
+
+	// inflightMu guards inflight, nextClaim and draining.
+	inflightMu sync.Mutex
+	// inflight holds the messages currently being processed by this manager's
+	// workers (at most one per worker), keyed by an opaque claim token. On
+	// shutdown they are NAK'd so they are redelivered immediately instead of
+	// after a full AckWait. A token (rather than the message value) is used as
+	// the key so tracking never depends on the concrete message type being
+	// comparable.
+	inflight map[uint64]jetstream.Msg
+	// nextClaim is the source of monotonic claim tokens.
+	nextClaim uint64
+	// draining is set once the manager's context is cancelled, after which
+	// workers stop claiming new messages.
+	draining bool
 }
 
 func New(nc *nats.Conn, opts Options) *TaskManager {
@@ -119,7 +135,52 @@ func New(nc *nats.Conn, opts Options) *TaskManager {
 	}
 }
 
-func (mgr *TaskManager) Start(ctx context.Context) error {
+// claimMsg registers msg as in-flight so it can be NAK'd on shutdown and
+// returns a token to release it with. ok is false if the manager is already
+// draining, in which case the caller must not process the message.
+func (mgr *TaskManager) claimMsg(msg jetstream.Msg) (token uint64, ok bool) {
+	mgr.inflightMu.Lock()
+	defer mgr.inflightMu.Unlock()
+
+	if mgr.draining {
+		return 0, false
+	}
+	if mgr.inflight == nil {
+		mgr.inflight = map[uint64]jetstream.Msg{}
+	}
+	mgr.nextClaim++
+	mgr.inflight[mgr.nextClaim] = msg
+	return mgr.nextClaim, true
+}
+
+// releaseMsg removes the claim from the in-flight set and reports whether the
+// caller still owns the message (true). It returns false when shutdown already
+// NAK'd the message, in which case the caller must not ack it.
+func (mgr *TaskManager) releaseMsg(token uint64) bool {
+	mgr.inflightMu.Lock()
+	defer mgr.inflightMu.Unlock()
+	if _, ok := mgr.inflight[token]; !ok {
+		return false
+	}
+	delete(mgr.inflight, token)
+	return true
+}
+
+// drainInflight marks the manager as draining and NAKs every in-flight message
+// so it is redelivered immediately rather than after a full AckWait.
+func (mgr *TaskManager) drainInflight() {
+	mgr.inflightMu.Lock()
+	defer mgr.inflightMu.Unlock()
+	mgr.draining = true
+	for token, msg := range mgr.inflight {
+		if err := msg.Nak(); err != nil && mgr.logNatsError {
+			klog.ErrorS(err, "failed to NAK in-flight natjobs msg on shutdown", "id", msg.Headers().Get(nats.MsgIdHdr))
+		}
+		delete(mgr.inflight, token)
+	}
+}
+
+func (mgr *TaskManager) Start(ctx context.Context, createConsumer bool) error {
 	jsm, err := jetstream.New(mgr.nc)
 	if err != nil {
 		return err
@@ -144,6 +205,15 @@ func (mgr *TaskManager) Start(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+	}
+
+	// A submit-only caller (createConsumer=false, e.g. a short-lived setup job)
+	// only needs the stream to exist so it can publish tasks. It must not create
+	// the durable "workers" consumer or launch workers: if it fetched a task into
+	// in-flight state and then exited before ack, redelivery would stall for a
+	// full AckWait.
+	if !createConsumer {
+		return nil
 	}
 
 	// create nats consumer
@@ -171,17 +241,33 @@ func (mgr *TaskManager) Start(ctx context.Context) error {
 	}
 	mgr.workerConsumer = consumer
 
+	// On shutdown (context cancelled, e.g. the process receiving SIGTERM on
+	// restart) negatively-acknowledge every message still in flight in this
+	// process. NAK triggers immediate redelivery, so the next process picks the
+	// task up right away instead of waiting a full AckWait for redelivery.
+	//
+	// Unlike deleting the shared durable consumer, this only affects the
+	// messages this process holds, so other replicas still bound to the same
+	// consumer keep working during a partial (e.g. rolling) restart.
+	go func() {
+		<-ctx.Done()
+		mgr.drainInflight()
+	}()
+
 	klog.Info("Starting workers")
 	// Launch workers to process and proxy the message to relevant subject from nats subject
 	for i := 0; i < mgr.numWorkersPerReplica; i++ {
-		go wait.Until(mgr.runWorker, 5*time.Second, ctx.Done())
+		go wait.Until(func() { mgr.runWorker(ctx) }, 5*time.Second, ctx.Done())
 	}
 
 	return nil
 }
 
-func (mgr *TaskManager) runWorker() {
+func (mgr *TaskManager) runWorker(ctx context.Context) {
 	for {
+		if ctx.Err() != nil {
+			return
+		}
 		err := mgr.processNextMsg()
 		if err != nil {
 			if mgr.logNatsError && !(strings.Contains(err.Error(), nats.ErrTimeout.Error()) || strings.Contains(err.Error(), "nats: Exceeded MaxWaiting")) {
@@ -198,6 +284,16 @@ func (mgr *TaskManager) processNextMsg() (err error) {
 		// no more msg to process
 		err = errors.Wrap(err, "failed to fetch msg")
 		return
+	}
+
+	// If the manager is shutting down, hand the message straight back so it is
+	// redelivered immediately instead of being processed by a dying process.
+	token, ok := mgr.claimMsg(msg)
+	if !ok {
+		if e := msg.Nak(); e != nil && mgr.logNatsError {
+			klog.ErrorS(e, "failed to NAK natjobs msg during drain", "id", msg.Headers().Get(nats.MsgIdHdr))
+		}
+		return nil
 	}
 
 	var ev *cloudeventssdk.Event
@@ -221,6 +317,13 @@ func (mgr *TaskManager) processNextMsg() (err error) {
 			}
 		}
 
+		// Only ack if we still own the message. If shutdown NAK'd it while the
+		// task was running, it has already been redelivered, so acking here
+		// would be a no-op at best and could ack a message another worker is now
+		// processing.
+		if !mgr.releaseMsg(token) {
+			return
+		}
 		// report failure ?
 		if e2 := msg.Ack(); e2 != nil && mgr.logNatsError {
 			klog.ErrorS(err, "failed ACK msg", "id", msg.Headers().Get(nats.MsgIdHdr))
