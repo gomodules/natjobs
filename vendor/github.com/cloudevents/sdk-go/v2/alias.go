@@ -135,8 +135,14 @@ var (
 	ToMessage = binding.ToMessage
 
 	// Event Creation
-	NewEventFromHTTPRequest  = http.NewEventFromHTTPRequest
-	NewEventFromHTTPResponse = http.NewEventFromHTTPResponse
+
+	NewEventFromHTTPRequest   = http.NewEventFromHTTPRequest
+	NewEventFromHTTPResponse  = http.NewEventFromHTTPResponse
+	NewEventsFromHTTPRequest  = http.NewEventsFromHTTPRequest
+	NewEventsFromHTTPResponse = http.NewEventsFromHTTPResponse
+	NewHTTPRequestFromEvent   = http.NewHTTPRequestFromEvent
+	NewHTTPRequestFromEvents  = http.NewHTTPRequestFromEvents
+	IsHTTPBatch               = http.IsHTTPBatch
 
 	// HTTP Messages
 
@@ -167,6 +173,7 @@ var (
 
 	WithTarget          = http.WithTarget
 	WithHeader          = http.WithHeader
+	WithHost            = http.WithHost
 	WithShutdownTimeout = http.WithShutdownTimeout
 	//WithEncoding           = http.WithEncoding
 	//WithStructuredEncoding = http.WithStructuredEncoding // TODO: expose new way

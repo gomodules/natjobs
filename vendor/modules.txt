@@ -1,5 +1,5 @@
-# github.com/cloudevents/sdk-go/v2 v2.13.0
-## explicit; go 1.17
+# github.com/cloudevents/sdk-go/v2 v2.16.2
+## explicit; go 1.23.0
 github.com/cloudevents/sdk-go/v2
 github.com/cloudevents/sdk-go/v2/binding
 github.com/cloudevents/sdk-go/v2/binding/format
@@ -20,9 +20,7 @@ github.com/go-logr/logr
 github.com/go-logr/logr/funcr
 # github.com/golang/protobuf v1.5.2
 ## explicit; go 1.9
-# github.com/google/go-cmp v0.5.9
-## explicit; go 1.13
-# github.com/google/uuid v1.3.0
+# github.com/google/uuid v1.6.0
 ## explicit
 github.com/google/uuid
 # github.com/json-iterator/go v1.1.12
@@ -31,14 +29,30 @@ github.com/json-iterator/go
 # github.com/klauspost/compress v1.17.0
 ## explicit; go 1.18
 github.com/klauspost/compress/flate
+github.com/klauspost/compress/s2
+# github.com/minio/highwayhash v1.0.2
+## explicit; go 1.15
+github.com/minio/highwayhash
 # github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd
 ## explicit
 github.com/modern-go/concurrent
 # github.com/modern-go/reflect2 v1.0.2
 ## explicit; go 1.12
 github.com/modern-go/reflect2
-# github.com/nats-io/nats-server/v2 v2.9.11
+# github.com/nats-io/jwt/v2 v2.5.0
+## explicit; go 1.18
+github.com/nats-io/jwt/v2
+# github.com/nats-io/nats-server/v2 v2.9.25
 ## explicit; go 1.19
+github.com/nats-io/nats-server/v2/conf
+github.com/nats-io/nats-server/v2/internal/ldap
+github.com/nats-io/nats-server/v2/logger
+github.com/nats-io/nats-server/v2/server
+github.com/nats-io/nats-server/v2/server/certidp
+github.com/nats-io/nats-server/v2/server/certstore
+github.com/nats-io/nats-server/v2/server/pse
+github.com/nats-io/nats-server/v2/server/sysmem
+github.com/nats-io/nats-server/v2/test
 # github.com/nats-io/nats.go v1.30.2
 ## explicit; go 1.20
 github.com/nats-io/nats.go
@@ -58,23 +72,29 @@ github.com/pkg/errors
 # github.com/rs/xid v1.4.0
 ## explicit; go 1.12
 github.com/rs/xid
-# go.uber.org/atomic v1.7.0
-## explicit; go 1.13
-go.uber.org/atomic
-# go.uber.org/multierr v1.6.0
-## explicit; go 1.12
+# go.uber.org/multierr v1.11.0
+## explicit; go 1.19
 go.uber.org/multierr
-# go.uber.org/zap v1.21.0
-## explicit; go 1.13
+# go.uber.org/zap v1.27.0
+## explicit; go 1.19
 go.uber.org/zap
 go.uber.org/zap/buffer
+go.uber.org/zap/internal
 go.uber.org/zap/internal/bufferpool
 go.uber.org/zap/internal/color
 go.uber.org/zap/internal/exit
+go.uber.org/zap/internal/pool
+go.uber.org/zap/internal/stacktrace
 go.uber.org/zap/zapcore
-# golang.org/x/crypto v0.6.0
+# golang.org/x/crypto v0.12.0
 ## explicit; go 1.17
+golang.org/x/crypto/bcrypt
 golang.org/x/crypto/blake2b
+golang.org/x/crypto/blowfish
+golang.org/x/crypto/chacha20
+golang.org/x/crypto/chacha20poly1305
+golang.org/x/crypto/cryptobyte
+golang.org/x/crypto/cryptobyte/asn1
 golang.org/x/crypto/curve25519
 golang.org/x/crypto/curve25519/internal/field
 golang.org/x/crypto/ed25519
@@ -82,11 +102,19 @@ golang.org/x/crypto/internal/alias
 golang.org/x/crypto/internal/poly1305
 golang.org/x/crypto/nacl/box
 golang.org/x/crypto/nacl/secretbox
+golang.org/x/crypto/ocsp
 golang.org/x/crypto/salsa20/salsa
-# golang.org/x/sys v0.5.0
+# golang.org/x/sys v0.11.0
 ## explicit; go 1.17
 golang.org/x/sys/cpu
-# golang.org/x/text v0.7.0
+golang.org/x/sys/internal/unsafeheader
+golang.org/x/sys/unix
+golang.org/x/sys/windows
+golang.org/x/sys/windows/registry
+golang.org/x/sys/windows/svc
+golang.org/x/sys/windows/svc/eventlog
+golang.org/x/sys/windows/svc/mgr
+# golang.org/x/text v0.12.0
 ## explicit; go 1.17
 golang.org/x/text/cases
 golang.org/x/text/internal
@@ -96,8 +124,9 @@ golang.org/x/text/internal/tag
 golang.org/x/text/language
 golang.org/x/text/transform
 golang.org/x/text/unicode/norm
-# golang.org/x/time v0.0.0-20220922220347-f3bd1da661af
-## explicit
+# golang.org/x/time v0.12.0
+## explicit; go 1.23.0
+golang.org/x/time/rate
 # gomodules.xyz/clock v0.0.0-20200817085942-06523dba733f
 ## explicit; go 1.14
 gomodules.xyz/clock
@@ -106,8 +135,6 @@ gomodules.xyz/clock
 gomodules.xyz/wait
 # google.golang.org/protobuf v1.28.1
 ## explicit; go 1.11
-# gopkg.in/yaml.v2 v2.4.0
-## explicit; go 1.15
 # k8s.io/klog/v2 v2.80.1
 ## explicit; go 1.13
 k8s.io/klog/v2
